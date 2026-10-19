@@ -1,0 +1,595 @@
+"""创建统一邻井数据库。
+
+数据库采用“一井一表”结构：
+
+    1. 输入模块提供 well_id；
+    2. 每口井对应一张独立的数据表；
+    3. 所有井表字段结构完全一致；
+    4. 每张井表的 MD 从 0.00 m 开始；
+    5. MD 每 0.01 m 一个数据点；
+    6. 最大深度根据该井数据中的最大 MD 自动确定；
+    7. 最大 MD 向上覆盖到最近的 0.01 m；
+    8. 同一口井重新导入时，删除旧表并重新建立，
+       实现整口井数据替换。
+
+本模块只负责：
+    - 创建数据库；
+    - 创建井数据表；
+    - 创建统一 MD 网格；
+    - 重新导入同井时清除旧数据。
+
+实际测井数据的写入由输入模块负责。
+"""
+
+import hashlib
+import sqlite3
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
+
+from connection import DB_PATH
+
+
+# ============================================================
+# 基本参数
+# ============================================================
+
+# MD 统一采样间隔，单位：m
+MD_STEP = Decimal("0.01")
+
+# SQLite 批量写入大小
+BATCH_SIZE = 10000
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def _normalize_well_id(well_id):
+    """
+    检查并标准化井号。
+
+    井号直接作为 SQLite 数据表名称使用。
+    """
+
+    if not isinstance(well_id, str):
+        raise ValueError(
+            "well_id 必须是字符串"
+        )
+
+    well_id = well_id.strip()
+
+    if not well_id:
+        raise ValueError(
+            "well_id 不能为空"
+        )
+
+    if "\x00" in well_id:
+        raise ValueError(
+            "well_id 不能包含空字符"
+        )
+
+    # sqlite_ 前缀由 SQLite 内部保留
+    if well_id.lower().startswith("sqlite_"):
+        raise ValueError(
+            "well_id 不能以 sqlite_ 开头，"
+            "该前缀由 SQLite 保留使用"
+        )
+
+    return well_id
+
+
+def _quote_identifier(name):
+    """
+    安全引用 SQLite 表名或索引名。
+
+    例如：
+
+        A
+        ->
+        "A"
+
+        A-01
+        ->
+        "A-01"
+
+        A井
+        ->
+        "A井"
+    """
+
+    return (
+        '"'
+        + name.replace('"', '""')
+        + '"'
+    )
+
+
+def _make_tvd_index_name(well_id):
+    """
+    为每口井生成唯一的 TVD 索引名称。
+
+    SQLite 的索引名在整个数据库中必须唯一，
+    因此使用井号生成一个短哈希值。
+    """
+
+    digest = hashlib.sha1(
+        well_id.encode("utf-8")
+    ).hexdigest()[:12]
+
+    return f"idx_tvd_{digest}"
+
+
+def _get_max_md_and_index(md_values):
+    """
+    获取该井数据中的最大 MD，
+    并计算统一 0.01 m 网格的最大编号。
+
+    例如：
+
+        最大 MD = 1234.567
+
+    最终 MD 网格覆盖到：
+
+        1234.57
+    """
+
+    valid_md = []
+
+    for value in md_values:
+
+        # 空值跳过
+        if value is None:
+            continue
+
+        try:
+            md = Decimal(
+                str(value)
+            )
+
+        except (
+            InvalidOperation,
+            ValueError,
+            TypeError,
+        ) as exc:
+
+            raise ValueError(
+                f"非法 MD 值：{value!r}"
+            ) from exc
+
+        # 不允许 NaN、Inf
+        if not md.is_finite():
+            raise ValueError(
+                f"MD 必须为有限数值：{value!r}"
+            )
+
+        # MD 不允许为负数
+        if md < 0:
+            raise ValueError(
+                f"MD 不能小于 0：{value!r}"
+            )
+
+        valid_md.append(md)
+
+    if not valid_md:
+        raise ValueError(
+            "测井数据中没有有效的 MD 数据"
+        )
+
+    max_md = max(
+        valid_md
+    )
+
+    # 最大 MD 向上覆盖到最近的 0.01 m
+    max_index = int(
+        (
+            max_md / MD_STEP
+        ).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
+
+    return (
+        max_md,
+        max_index,
+    )
+
+
+def _check_table_name_conflict(
+    conn,
+    well_id,
+):
+    """
+    检查是否存在仅大小写不同的井表。
+
+    SQLite 的 ASCII 表名大小写不敏感。
+
+    例如：
+
+        已经存在 A
+        又输入 a
+
+    为避免误删 A 表，这里直接报错。
+    """
+
+    row = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = ? COLLATE NOCASE
+        """,
+        (
+            well_id,
+        ),
+    ).fetchone()
+
+    if (
+        row is not None
+        and row[0] != well_id
+    ):
+        raise ValueError(
+            f'井号 "{well_id}" 与已有井表 '
+            f'"{row[0]}" 仅大小写不同，'
+            "SQLite 会将它们视为同一个表名"
+        )
+
+
+# ============================================================
+# 创建空井表
+# ============================================================
+
+def _create_empty_well_table(
+    conn,
+    well_id,
+):
+    """
+    在已经打开的数据库连接中创建一张空井表。
+
+    此函数假定对应井表当前不存在。
+    """
+
+    quoted_table = (
+        _quote_identifier(
+            well_id
+        )
+    )
+
+    # --------------------------------------------------------
+    # 创建井数据表
+    # --------------------------------------------------------
+
+    conn.execute(f"""
+    CREATE TABLE {quoted_table}
+    (
+        MD REAL NOT NULL PRIMARY KEY,
+
+        TVD REAL,
+        INC REAL,
+        AZIM REAL,
+
+        AC REAL,
+        GR REAL,
+        DEN REAL,
+
+        Lith TEXT,
+        geol_time TEXT,
+
+        VSH REAL,
+        VP REAL,
+        VS REAL,
+
+        NU_D REAL,
+        NU_S REAL,
+
+        E_D REAL,
+        E_S REAL,
+
+        UCS REAL,
+        ST REAL,
+        FANG REAL,
+
+        Poro REAL,
+        BIOT REAL,
+
+        Coh REAL,
+        hard REAL,
+
+        Da REAL,
+        Ab REAL,
+
+        Over_P REAL,
+
+        P_p REAL,
+        RHO_P REAL,
+
+        P_c REAL,
+        RHO_C REAL,
+
+        P_f REAL,
+        RHO_F REAL,
+
+        section_no INTEGER,
+        bit_size REAL,
+        casing_size REAL,
+        hanger_type TEXT
+    )
+    """)
+
+    # --------------------------------------------------------
+    # 创建 TVD 查询索引
+    # --------------------------------------------------------
+
+    index_name = (
+        _make_tvd_index_name(
+            well_id
+        )
+    )
+
+    quoted_index = (
+        _quote_identifier(
+            index_name
+        )
+    )
+
+    conn.execute(f"""
+    CREATE INDEX {quoted_index}
+    ON {quoted_table} (TVD)
+    """)
+
+
+# ============================================================
+# 初始化数据库
+# ============================================================
+
+def create_database():
+    """
+    初始化邻井数据库。
+
+    这里只创建 SQLite 数据库文件，
+    不提前建立任何井表。
+    """
+
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+    )
+
+    try:
+
+        conn.execute(
+            "SELECT 1"
+        )
+
+    finally:
+
+        conn.close()
+
+    print(
+        f"邻井数据库初始化完成：{DB_PATH}"
+    )
+
+
+# ============================================================
+# 创建 / 替换井表及 MD 网格
+# ============================================================
+
+def create_md_grid(
+    well_id,
+    md_values,
+):
+    """
+    根据井号和该井最大 MD，
+    创建统一的 MD 深度网格。
+
+    重要规则
+    --------
+
+    如果该井不存在：
+
+        创建新井表
+        +
+        创建 MD 网格。
+
+    如果该井已经存在：
+
+        删除原井表
+        +
+        创建全新的井表
+        +
+        重新创建 MD 网格。
+
+    因此，同一井号重新导入时，
+    原来的所有旧数据都会被完全清除。
+
+    MD 规则
+    -------
+
+        0.00
+        0.01
+        0.02
+        0.03
+        ...
+
+    一直到该井新的最大 MD。
+
+    Parameters
+    ----------
+    well_id : str
+        井号。
+
+    md_values
+        新数据中的 MD 数据。
+    """
+
+    # --------------------------------------------------------
+    # 1. 检查井号
+    # --------------------------------------------------------
+
+    well_id = (
+        _normalize_well_id(
+            well_id
+        )
+    )
+
+    # --------------------------------------------------------
+    # 2. 先检查新数据 MD
+    #
+    # 必须在删除旧表之前检查。
+    #
+    # 如果新数据本身有问题，
+    # 原来的井表不会受到任何影响。
+    # --------------------------------------------------------
+
+    max_md, max_index = (
+        _get_max_md_and_index(
+            md_values
+        )
+    )
+
+    quoted_table = (
+        _quote_identifier(
+            well_id
+        )
+    )
+
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+    )
+
+    try:
+
+        # ----------------------------------------------------
+        # 一个事务内完成：
+        #
+        # 删除旧表
+        # ->
+        # 创建新表
+        # ->
+        # 创建 MD 网格
+        #
+        # 如果中间发生异常，
+        # 整个事务回滚。
+        # ----------------------------------------------------
+
+        with conn:
+
+            conn.execute(
+                "BEGIN IMMEDIATE"
+            )
+
+            # 防止 A / a 这种井号误操作
+            _check_table_name_conflict(
+                conn,
+                well_id,
+            )
+
+            # ------------------------------------------------
+            # 3. 删除原有井表
+            #
+            # 如果不存在，不产生错误。
+            # ------------------------------------------------
+
+            conn.execute(f"""
+            DROP TABLE IF EXISTS {quoted_table}
+            """)
+
+            # ------------------------------------------------
+            # 4. 创建全新的井表
+            # ------------------------------------------------
+
+            _create_empty_well_table(
+                conn,
+                well_id,
+            )
+
+            # ------------------------------------------------
+            # 5. 创建统一 MD 网格
+            # ------------------------------------------------
+
+            insert_sql = f"""
+            INSERT INTO {quoted_table}
+            (
+                MD
+            )
+            VALUES
+            (
+                ?
+            )
+            """
+
+            batch = []
+
+            for i in range(
+                max_index + 1
+            ):
+
+                # 使用整数 i 生成统一深度网格
+                #
+                # 0 -> 0.00
+                # 1 -> 0.01
+                # 2 -> 0.02
+                # ...
+                md = float(
+                    Decimal(i)
+                    * MD_STEP
+                )
+
+                batch.append(
+                    (
+                        md,
+                    )
+                )
+
+                # 批量写入
+                if (
+                    len(batch)
+                    >= BATCH_SIZE
+                ):
+
+                    conn.executemany(
+                        insert_sql,
+                        batch,
+                    )
+
+                    batch.clear()
+
+            # 写入最后不足 BATCH_SIZE 条的数据
+            if batch:
+
+                conn.executemany(
+                    insert_sql,
+                    batch,
+                )
+
+    finally:
+
+        conn.close()
+
+    # --------------------------------------------------------
+    # 6. 输出结果
+    # --------------------------------------------------------
+
+    max_grid_md = (
+        Decimal(max_index)
+        * MD_STEP
+    )
+
+    point_count = (
+        max_index + 1
+    )
+
+    print(
+        f"井 {well_id} 数据表已重新建立："
+        f"0.00 m ~ {max_grid_md:.2f} m，"
+        f"新数据最大 MD = {max_md} m，"
+        f"共 {point_count} 个深度点"
+    )
+
+
+# ============================================================
+# 程序入口
+# ============================================================
+
+if __name__ == "__main__":
+
+    create_database()
