@@ -274,8 +274,8 @@ def _create_empty_well_table(
         geol_time TEXT,
 
         VSH REAL,
-        VP REAL,
-        VS REAL,
+        AC_usm REAL,
+        DT_S REAL,
 
         NU_D REAL,
         NU_S REAL,
@@ -297,6 +297,9 @@ def _create_empty_well_table(
         Ab REAL,
 
         Over_P REAL,
+
+        SHmax REAL,   
+        Shmin REAL,   
 
         P_p REAL,
         RHO_P REAL,
