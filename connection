@@ -1,0 +1,26 @@
+"""统一邻井数据库路径，供建库、写入和查询模块共用。"""
+
+import sqlite3
+from pathlib import Path
+
+
+# 数据库固定放在本文件所在目录，不随运行时工作目录变化。
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "NeighborWellDB.db"
+
+
+def get_connection():
+    """连接已存在的数据库；调用方负责提交、回滚和关闭连接。"""
+    if not DB_PATH.is_file():
+        raise FileNotFoundError(
+            f"未找到数据库文件：{DB_PATH}\n"
+            "请先运行 create_NeighborWellDB.py 创建数据库。"
+        )
+
+    # mode=rw 只打开已有数据库，避免文件消失时自动创建空库。
+    database_uri = DB_PATH.as_uri() + "?mode=rw"
+    conn = sqlite3.connect(database_uri, uri=True)
+
+    # 查询结果支持按字段名访问和 dict(row) 转换。
+    conn.row_factory = sqlite3.Row
+    return conn
