@@ -1,0 +1,1517 @@
+"""邻井岩石力学与地应力主计算程序。
+
+在【0】运行配置区填写 WELL_ID 和 DEFAULT_STRESS_MODEL 即可运行。
+公式库通过 import 导入，不必设置公式路径。
+先按井号读取完整测井行，再按六个计算块执行26步计算。
+全部成功后统一写回23个结果字段，其他列（例如 hard、Ab）不受影响。
+上覆压力由 TVD、Poro、DEN 在每个深度点独立计算，不累积。
+"""
+
+import argparse
+from math import asin, cos, exp, isfinite, log, pi, sin
+import geomechanics_formulas
+import stress_formulas
+from connection import get_connection
+
+
+# ==========================================================================
+# 【0】运行配置区 —— 日常运行只需修改两个设置
+# ==========================================================================
+
+# 井号与 NeighborWellDB.db 中的井表名称一致
+WELL_ID = "A01"
+
+# None：运行时选择；也可固定为 "六五模型" 或 "七五模型"
+DEFAULT_STRESS_MODEL = "六五模型"
+
+
+# ==========================================================================
+# 【1】计算字段及模型
+# ==========================================================================
+
+# 仅检查计算所需的基础输入，不检查尚未计算的结果字段。
+REQUIRED_FIELDS = (
+    "MD",
+    "TVD",
+    "AC",
+    "GR",
+    "DEN",
+    "Lith",
+    "geol_time",
+)
+
+# 仅写回已有公式并已在主流程中计算完成的结果列。
+# hard、Ab 尚未计算，不放入 UPDATE，保留数据库原值。
+CALCULATED_FIELDS = (
+    "VSH", "AC_usm", "DT_S",
+    "NU_D", "NU_S",
+    "E_D", "E_S",
+    "UCS", "ST", "FANG",
+    "Poro", "BIOT",
+    "Coh", "Da",
+    "Over_P",
+    "SHmax", "Shmin",
+    "P_p", "RHO_P",
+    "P_c", "RHO_C",
+    "P_f", "RHO_F",
+)
+
+STRESS_MODELS = ("六五模型", "七五模型")
+
+
+def select_stress_model():
+    """由操作者在计算前选择水平主应力模型，输入无效时重新选择。"""
+    print("请选择本次计算的水平主应力模型：")
+    for number, model in enumerate(STRESS_MODELS, 1):
+        print(f"  {number}. {model}")
+
+    choices = {str(number): model for number, model in enumerate(STRESS_MODELS, 1)}
+    while True:
+        try:
+            choice = input("请输入 1 或 2：").strip()
+        except EOFError as exc:
+            raise ValueError(
+                "未完成模型选择，请通过交互菜单或 --stress-model 明确指定模型"
+            ) from exc
+        if choice in choices:
+            return choices[choice]
+        print("输入无效，请输入 1（六五模型）或 2（七五模型）。")
+
+
+# ==========================================================================
+# 【2】基础工具：模型选择 / 井表存在检查 / SQL 标识符 / 缺失值
+# ==========================================================================
+
+def check_well_exists(well_id, conn=None):
+    """只检查数据库中是否存在与输入井号完全一致的数据表。"""
+    close_conn = conn is None
+    if close_conn:
+        conn = get_connection()
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = ? COLLATE BINARY",
+            (well_id,),
+        ).fetchone()
+        if found is None:
+            raise ValueError(f"邻井数据库中不存在井号对应的数据表：{well_id}")
+        return well_id
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def _quote_identifier(name):
+    """安全引用 SQLite 标识符，兼容中文、空格和双引号。"""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _is_missing(value):
+    """NULL、空字符串及纯空白字符串视为缺失；数值 0 有效。"""
+    return value is None or (
+        isinstance(value, str) and not value.strip()
+    )
+
+
+# ==========================================================================
+# 【3】第0步：按井号从数据库读取完整行
+# ==========================================================================
+
+def read_complete_well_data(well_id):
+    """按 MD 升序读取指定井的数据，只返回必需字段完整的行。
+
+    任一必需字段缺失时，整行跳过。保留数据库中的原始字段值，
+    不进行数值范围检查、单位转换、补值或分类名称转换。
+
+    Returns
+    -------
+    dict
+        well_id: 在数据库中找到的井表名称。
+        rows: 完整行组成的字典列表，按 MD 升序排列。
+        total_count: 该井读取的总行数。
+        complete_count: 完整行数。
+        skipped_count: 因字段缺失而跳过的行数。
+
+    空井表或全部行不完整时，rows 返回空列表。
+    数据库不存在、井表不存在或缺少必需列时，抛出异常。
+    """
+    conn = get_connection()
+
+    try:
+        well_id = check_well_exists(well_id, conn)
+        quoted_table = _quote_identifier(well_id)
+
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({quoted_table})")
+        }
+        missing_columns = [
+            field for field in REQUIRED_FIELDS if field not in columns
+        ]
+        if missing_columns:
+            raise ValueError(
+                f"井表 {well_id} 缺少必需字段："
+                + ", ".join(missing_columns)
+            )
+
+        selected_fields = ", ".join(
+            _quote_identifier(field) for field in REQUIRED_FIELDS
+        )
+        cursor = conn.execute(
+            f"SELECT {selected_fields} FROM {quoted_table} ORDER BY MD ASC"
+        )
+
+        complete_rows = []
+        total_count = 0
+        for row in cursor:
+            total_count += 1
+            if any(_is_missing(row[field]) for field in REQUIRED_FIELDS):
+                continue
+            complete_rows.append(dict(row))
+
+    finally:
+        # sqlite3 连接的事务上下文不会自动关闭连接，这里显式关闭。
+        conn.close()
+
+    complete_count = len(complete_rows)
+    return {
+        "well_id": well_id,
+        "rows": complete_rows,
+        "total_count": total_count,
+        "complete_count": complete_count,
+        "skipped_count": total_count - complete_count,
+    }
+
+
+# ==========================================================================
+# 【4】公式使用模块 import，无需再调用 load_*_formulas()
+# 【5】下方函数为各参数计算逻辑（保留原有公式求值与异常处理）
+# ==========================================================================
+
+
+def calculate_ac_usm(rows, geological_formulas):
+    """使用 AC_usm_FORMULAS['AC_usm']，为每一完整行计算纵波时差。
+
+    输入 AC 单位：μs/ft；输出 AC_usm 单位：μs/m。
+    原地更新 rows 内的字典，不进行舍入，不写入数据库。
+    """
+    formula = geological_formulas.get("AC_usm_FORMULAS", {}).get("AC_usm")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 AC_usm_FORMULAS['AC_usm'] 公式字符串")
+
+    # 一次编译，全部完整行复用；计算表达式来自已有公式文件。
+    compiled_formula = compile(formula, "<AC_usm公式>", "eval")
+    for row in rows:
+        row["AC_usm"] = eval(
+            compiled_formula,
+            {"__builtins__": {}},
+            {"AC": row["AC"]},
+        )
+    return rows
+
+
+def calculate_dt_s(rows, geological_formulas):
+    """按岩性选择 DT_S 公式，按地质年代选择系数，计算横波时差。
+
+    使用 DT_S_FORMULAS['formulas'] 和 ['coefficients'] 的原有结构。
+    须先完成 AC_usm 计算；AC_usm 和计算结果 DT_S 的单位均为 μs/m。
+    原地更新 rows，不进行舍入，不写数据库。
+    岩性或年代未配置时，报出该行 MD 并停止计算。
+    """
+    if not rows:
+        return rows
+
+    config = geological_formulas.get("DT_S_FORMULAS", {})
+    formula_groups = config.get("formulas", {})
+    coefficient_sets = config.get("coefficients", {})
+    if not formula_groups or not coefficient_sets:
+        raise ValueError("DT_S_FORMULAS 必须提供 formulas 和 coefficients 配置")
+
+    # 每个岩性组的公式只编译一次，同组岩性复用同一公式。
+    compiled_by_lith = {}
+    for lithologies, formula in formula_groups.items():
+        compiled_formula = compile(formula, "<DT_S公式>", "eval")
+        for lithology in lithologies:
+            compiled_by_lith[lithology] = compiled_formula
+
+    for row in rows:
+        lithology = row["Lith"]
+        geol_time = row["geol_time"]
+        compiled_formula = compiled_by_lith.get(lithology)
+        if compiled_formula is None:
+            raise ValueError(
+                f"MD={row['MD']}：岩性 {lithology!r} 未配置 DT_S 公式"
+            )
+
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 DT_S 系数"
+            )
+
+        # 复制系数后加入当前行输入，不修改公式文件中的系数字典。
+        variables = dict(coefficients)
+        variables.update({"AC_usm": row["AC_usm"], "DEN": row["DEN"]})
+        try:
+            row["DT_S"] = eval(
+                compiled_formula,
+                {"__builtins__": {}, "exp": exp},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，岩性={lithology!r}，年代={geol_time!r}："
+                f"DT_S 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_poro(rows, geological_formulas):
+    """使用通用孔隙度公式，按地质年代读取 ACma，计算 Poro。
+
+    使用 Poro_FORMULAS['formula'] 和 ['coefficients'] 的原有结构。
+    须先完成 AC_usm 计算；ACma 与 AC_usm 使用相同单位 μs/m。
+    Poro 保持公式输出的小数比例，不乘以 100，不截断、不舍入。
+    原地更新 rows，不写数据库。年代或 ACma 未配置时明确报错。
+    """
+    if not rows:
+        return rows
+
+    config = geological_formulas.get("Poro_FORMULAS", {})
+    formula = config.get("formula")
+    coefficient_sets = config.get("coefficients", {})
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 Poro_FORMULAS['formula'] 公式字符串")
+    if not coefficient_sets:
+        raise ValueError("Poro_FORMULAS 必须提供 coefficients 配置")
+
+    compiled_formula = compile(formula, "<Poro公式>", "eval")
+    for row in rows:
+        geol_time = row["geol_time"]
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 Poro 系数"
+            )
+        if _is_missing(coefficients.get("ACma")):
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                "ACma 尚未配置，请在 geomechanics_formulas.py 中填写后计算 Poro"
+            )
+
+        variables = dict(coefficients)
+        variables["AC_usm"] = row["AC_usm"]
+        try:
+            row["Poro"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                f"Poro 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_igr(rows, geological_formulas):
+    """按地质年代统计完整行的 GR 极值，再使用配置公式计算 IGR。
+
+    同一年代的全部完整行共用 GR_min、GR_max，不再按岩性或连续层段拆分。
+    统计范围仅为当前井筛选后的完整行，不包含已跳过的不完整行。
+    使用 VSH_FORMULAS['IGR']，结果原地保存在 row['IGR'] 中。
+    某年代 GR 极值相等时明确报错，不代填 IGR。
+    """
+    if not rows:
+        return rows
+
+    formula = geological_formulas.get("VSH_FORMULAS", {}).get("IGR")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 VSH_FORMULAS['IGR'] 公式字符串")
+    compiled_formula = compile(formula, "<IGR公式>", "eval")
+
+    gr_ranges = {}
+    for row in rows:
+        geol_time = row["geol_time"]
+        gr = row["GR"]
+        gr_min, gr_max = gr_ranges.get(geol_time, (gr, gr))
+        gr_ranges[geol_time] = (min(gr_min, gr), max(gr_max, gr))
+
+    # 包括仅有一个完整点的年代；此时标准公式的分母也为零。
+    for geol_time, (gr_min, gr_max) in gr_ranges.items():
+        if gr_min == gr_max:
+            raise ValueError(
+                f"地质年代 {geol_time!r} 的完整行 GR_min = GR_max = {gr_min}，"
+                "无法计算 IGR"
+            )
+
+    for row in rows:
+        geol_time = row["geol_time"]
+        gr_min, gr_max = gr_ranges[geol_time]
+        variables = {"GR": row["GR"], "GR_min": gr_min, "GR_max": gr_max}
+        try:
+            row["IGR"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                f"IGR 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_vsh(rows, geological_formulas):
+    """按地质年代选择 VSH_N，使用已计算的 IGR 计算 VSH。
+
+    使用 VSH_FORMULAS['VSH'] 和 ['coefficients'] 的原有结构。
+    VSH 保持小数比例，不乘以 100，不截断、不舍入。
+    原地更新 rows，不写数据库；IGR 保留为后续可查看的内存中间量。
+    """
+    if not rows:
+        return rows
+
+    config = geological_formulas.get("VSH_FORMULAS", {})
+    formula = config.get("VSH")
+    coefficient_sets = config.get("coefficients", {})
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 VSH_FORMULAS['VSH'] 公式字符串")
+    if not coefficient_sets:
+        raise ValueError("VSH_FORMULAS 必须提供 coefficients 配置")
+    compiled_formula = compile(formula, "<VSH公式>", "eval")
+
+    for row in rows:
+        geol_time = row["geol_time"]
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 VSH 系数"
+            )
+        if _is_missing(coefficients.get("VSH_N")):
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}：VSH_N 尚未配置"
+            )
+
+        variables = dict(coefficients)
+        variables["IGR"] = row["IGR"]
+        try:
+            row["VSH"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                f"VSH 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_da(rows, geological_formulas):
+    """按地质年代读取 DA_A、DA_B，使用 AC_usm 计算可钻性指数 Da。
+
+    使用 Da_FORMULAS['formula'] 和 ['coefficients'] 的原有结构。
+    公式中的 ln 对应 math.log，自然对数输入为单位 μs/m 的 AC_usm。
+    原地更新 row['Da']，不截断、不舍入，不写数据库。
+    年代、系数未配置或公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    config = geological_formulas.get("Da_FORMULAS", {})
+    formula = config.get("formula")
+    coefficient_sets = config.get("coefficients", {})
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 Da_FORMULAS['formula'] 公式字符串")
+    if not coefficient_sets:
+        raise ValueError("Da_FORMULAS 必须提供 coefficients 配置")
+    compiled_formula = compile(formula, "<Da公式>", "eval")
+
+    for row in rows:
+        geol_time = row["geol_time"]
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 Da 系数"
+            )
+        missing_coefficients = [
+            name for name in ("DA_A", "DA_B")
+            if _is_missing(coefficients.get(name))
+        ]
+        if missing_coefficients:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                + "、".join(missing_coefficients)
+                + " 尚未配置"
+            )
+
+        variables = dict(coefficients)
+        variables["AC_usm"] = row["AC_usm"]
+        try:
+            row["Da"] = eval(
+                compiled_formula,
+                {"__builtins__": {}, "ln": log},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                f"Da 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_nu_d(rows, geological_formulas):
+    """读取 NU_D_FORMULA，用已计算的 DT_S、AC_usm 计算动态泊松比。
+
+    此公式通用于所有岩性和地质年代，无需额外经验系数。
+    DT_S 与 AC_usm 均为 μs/m，计算结果 NU_D 无量纲。
+    原地更新 row['NU_D']，不截断、不舍入，不写数据库。
+    公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = geological_formulas.get("NU_D_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 NU_D_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<NU_D公式>", "eval")
+
+    for row in rows:
+        variables = {"DT_S": row["DT_S"], "AC_usm": row["AC_usm"]}
+        try:
+            row["NU_D"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：NU_D 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_e_d(rows, geological_formulas):
+    """读取 E_D_FORMULA，用 DEN、DT_S、AC_usm 计算动态弹性模量。
+
+    使用当前行 DEN 和已计算的 DT_S、AC_usm，无需额外经验系数。
+    直接执行公式库中的表达式，不另外换算或调整公式中的系数。
+    原地更新 row['E_D']，不截断、不舍入，不写数据库。
+    公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = geological_formulas.get("E_D_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 E_D_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<E_D公式>", "eval")
+
+    for row in rows:
+        variables = {
+            "DEN": row["DEN"],
+            "DT_S": row["DT_S"],
+            "AC_usm": row["AC_usm"],
+        }
+        try:
+            row["E_D"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：E_D 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_biot(rows, geological_formulas):
+    """按地质年代读取 BIOT_K，使用已计算的 Poro 计算比奥系数。
+
+    使用 BIOT_FORMULAS['formula'] 和 ['coefficients'] 的原有结构。
+    Poro 使用小数比例，BIOT 为无量纲结果。
+    原地更新 row['BIOT']，不截断、不舍入，不写数据库。
+    年代、系数未配置或公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    config = geological_formulas.get("BIOT_FORMULAS", {})
+    formula = config.get("formula")
+    coefficient_sets = config.get("coefficients", {})
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 BIOT_FORMULAS['formula'] 公式字符串")
+    if not coefficient_sets:
+        raise ValueError("BIOT_FORMULAS 必须提供 coefficients 配置")
+    compiled_formula = compile(formula, "<BIOT公式>", "eval")
+
+    for row in rows:
+        geol_time = row["geol_time"]
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 BIOT 系数"
+            )
+        if _is_missing(coefficients.get("BIOT_K")):
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}：BIOT_K 尚未配置"
+            )
+
+        variables = dict(coefficients)
+        variables["Poro"] = row["Poro"]
+        try:
+            row["BIOT"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                f"BIOT 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_nu_s(rows, geological_formulas):
+    """按岩性选择 NU_S 公式，按地质年代选择系数，计算静态泊松比。
+
+    使用 NU_S_FORMULAS['formulas'] 和 ['coefficients'] 的原有结构。
+    须先完成 NU_D、Poro 计算；Poro 使用小数比例，NU_S 无量纲。
+    原地更新 row['NU_S']，不截断、不舍入，不写数据库。
+    岩性或年代未配置、公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    config = geological_formulas.get("NU_S_FORMULAS", {})
+    formula_groups = config.get("formulas", {})
+    coefficient_sets = config.get("coefficients", {})
+    if not formula_groups or not coefficient_sets:
+        raise ValueError("NU_S_FORMULAS 必须提供 formulas 和 coefficients 配置")
+
+    # 按配置中的岩性组建立索引，每组公式只编译一次。
+    compiled_by_lith = {}
+    for lithologies, formula in formula_groups.items():
+        compiled_formula = compile(formula, "<NU_S公式>", "eval")
+        for lithology in lithologies:
+            compiled_by_lith[lithology] = compiled_formula
+
+    for row in rows:
+        lithology = row["Lith"]
+        geol_time = row["geol_time"]
+        compiled_formula = compiled_by_lith.get(lithology)
+        if compiled_formula is None:
+            raise ValueError(
+                f"MD={row['MD']}：岩性 {lithology!r} 未配置 NU_S 公式"
+            )
+
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 NU_S 系数"
+            )
+
+        variables = dict(coefficients)
+        variables.update({"NU_D": row["NU_D"], "Poro": row["Poro"]})
+        try:
+            row["NU_S"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，岩性={lithology!r}，年代={geol_time!r}："
+                f"NU_S 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_e_s(rows, geological_formulas):
+    """按地质年代读取 C1、C2，使用 Poro、E_D 计算静态弹性模量。
+
+    使用 E_S_FORMULAS['formula'] 和 ['coefficients'] 的原有结构。
+    Poro 使用小数比例，E_S 沿用 E_D 的单位，不额外换算。
+    原地更新 row['E_S']，不截断、不舍入，不写数据库。
+    年代、系数未配置或公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    config = geological_formulas.get("E_S_FORMULAS", {})
+    formula = config.get("formula")
+    coefficient_sets = config.get("coefficients", {})
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 E_S_FORMULAS['formula'] 公式字符串")
+    if not coefficient_sets:
+        raise ValueError("E_S_FORMULAS 必须提供 coefficients 配置")
+    compiled_formula = compile(formula, "<E_S公式>", "eval")
+
+    for row in rows:
+        geol_time = row["geol_time"]
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 E_S 系数"
+            )
+        missing_coefficients = [
+            name for name in ("C1", "C2")
+            if _is_missing(coefficients.get(name))
+        ]
+        if missing_coefficients:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                + "、".join(missing_coefficients)
+                + " 尚未配置"
+            )
+
+        variables = dict(coefficients)
+        variables.update({"Poro": row["Poro"], "E_D": row["E_D"]})
+        try:
+            row["E_S"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                f"E_S 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_ucs(rows, geological_formulas):
+    """按地质年代读取 D1、D2，使用 E_D、VSH 计算单轴抗压强度。
+
+    使用 UCS_FORMULAS['formula'] 和 ['coefficients'] 的原有结构。
+    使用动态弹性模量 E_D，VSH 使用小数比例，不额外进行单位换算。
+    原地更新 row['UCS']，不截断、不舍入，不写数据库。
+    年代、系数未配置或公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    config = geological_formulas.get("UCS_FORMULAS", {})
+    formula = config.get("formula")
+    coefficient_sets = config.get("coefficients", {})
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 UCS_FORMULAS['formula'] 公式字符串")
+    if not coefficient_sets:
+        raise ValueError("UCS_FORMULAS 必须提供 coefficients 配置")
+    compiled_formula = compile(formula, "<UCS公式>", "eval")
+
+    for row in rows:
+        geol_time = row["geol_time"]
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 UCS 系数"
+            )
+        missing_coefficients = [
+            name for name in ("D1", "D2")
+            if _is_missing(coefficients.get(name))
+        ]
+        if missing_coefficients:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                + "、".join(missing_coefficients)
+                + " 尚未配置"
+            )
+
+        variables = dict(coefficients)
+        variables.update({"E_D": row["E_D"], "VSH": row["VSH"]})
+        try:
+            row["UCS"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                f"UCS 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_fang(rows, geological_formulas):
+    """读取 FANG_FORMULA，使用 NU_S 计算内摩擦角，结果单位为度。
+
+    须先完成 NU_S 计算，无需额外岩性或年代系数。
+    公式中的 asin、pi 分别使用 math.asin、math.pi。
+    原地更新 row['FANG']，不截断、不舍入，不写数据库。
+    公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = geological_formulas.get("FANG_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 FANG_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<FANG公式>", "eval")
+
+    for row in rows:
+        try:
+            row["FANG"] = eval(
+                compiled_formula,
+                {"__builtins__": {}, "asin": asin, "pi": pi},
+                {"NU_S": row["NU_S"]},
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：FANG 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_st(rows, geological_formulas):
+    """按地质年代读取 ST_RT，使用已计算的 UCS 计算抗拉强度。
+
+    使用 ST_FORMULAS['formula'] 和 ['coefficients'] 的原有结构。
+    ST 沿用 UCS 的单位，不额外进行单位换算。
+    原地更新 row['ST']，不截断、不舍入，不写数据库。
+    年代、系数未配置或公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    config = geological_formulas.get("ST_FORMULAS", {})
+    formula = config.get("formula")
+    coefficient_sets = config.get("coefficients", {})
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 ST_FORMULAS['formula'] 公式字符串")
+    if not coefficient_sets:
+        raise ValueError("ST_FORMULAS 必须提供 coefficients 配置")
+    compiled_formula = compile(formula, "<ST公式>", "eval")
+
+    for row in rows:
+        geol_time = row["geol_time"]
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 ST 系数"
+            )
+        if _is_missing(coefficients.get("ST_RT")):
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}：ST_RT 尚未配置"
+            )
+
+        variables = dict(coefficients)
+        variables["UCS"] = row["UCS"]
+        try:
+            row["ST"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                f"ST 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_coh(rows, geological_formulas):
+    """读取 COH_FORMULA，使用已计算的 UCS、FANG 计算内聚力。
+
+    FANG 输入单位为度，保留公式内部的弧度转换；Coh 沿用 UCS 的单位。
+    公式中的 sin、cos、pi 使用 math.sin、math.cos、math.pi。
+    原地更新 row['Coh']，不截断、不舍入，不写数据库。
+    公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = geological_formulas.get("COH_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("公式文件必须提供 COH_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<Coh公式>", "eval")
+
+    for row in rows:
+        variables = {"UCS": row["UCS"], "FANG": row["FANG"]}
+        try:
+            row["Coh"] = eval(
+                compiled_formula,
+                {"__builtins__": {}, "sin": sin, "cos": cos, "pi": pi},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：Coh 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+
+
+def calculate_p_n(rows, stress_formulas):
+    """读取 P_n_FORMULA，使用当前行 TVD 计算静水压力。
+
+    当前公式为 0.00981 * 1.03 * TVD，TVD 使用 m，P_n 为 MPa。
+    无需按岩性、年代或应力模型选择系数。
+    原地更新 row['P_n']，不截断、不舍入，不写数据库。
+    公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = stress_formulas.get("P_n_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("应力公式文件必须提供 P_n_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<P_n公式>", "eval")
+
+    for row in rows:
+        try:
+            row["P_n"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                {"TVD": row["TVD"]},
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：P_n 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_ac_n(rows, stress_formulas):
+    """按地质年代读取 N1、N2，使用 TVD 计算正常压力声波时差。
+
+    使用 AC_N_FORMULAS['formula'] 和 ['coefficients'] 的原有结构。
+    公式中的 exp 使用 math.exp；保留公式输出，供后续与原始 AC 配合计算。
+    原地更新 row['AC_N']，不截断、不舍入，不写数据库。
+    年代、系数未配置或公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    config = stress_formulas.get("AC_N_FORMULAS", {})
+    formula = config.get("formula")
+    coefficient_sets = config.get("coefficients", {})
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("应力公式文件必须提供 AC_N_FORMULAS['formula'] 公式字符串")
+    if not coefficient_sets:
+        raise ValueError("AC_N_FORMULAS 必须提供 coefficients 配置")
+    compiled_formula = compile(formula, "<AC_N公式>", "eval")
+
+    for row in rows:
+        geol_time = row["geol_time"]
+        coefficients = coefficient_sets.get(geol_time)
+        if coefficients is None:
+            raise ValueError(
+                f"MD={row['MD']}：地质年代 {geol_time!r} 未配置 AC_N 系数"
+            )
+        missing_coefficients = [
+            name for name in ("N1", "N2")
+            if _is_missing(coefficients.get(name))
+        ]
+        if missing_coefficients:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                + "、".join(missing_coefficients)
+                + " 尚未配置"
+            )
+
+        variables = dict(coefficients)
+        variables["TVD"] = row["TVD"]
+        try:
+            row["AC_N"] = eval(
+                compiled_formula,
+                {"__builtins__": {}, "exp": exp},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，地质年代={geol_time!r}："
+                f"AC_N 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_over_p(rows, stress_formulas):
+    """逐深度点计算 Over_P，不进行增量积分或累计。"""
+    if not rows:
+        return rows
+
+    formula = stress_formulas.get("OVER_P_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("stress_formulas.py 中缺少 OVER_P_FORMULA")
+    compiled = compile(formula, "<Over_P公式>", "eval")
+
+    for row in rows:
+        values = {
+            "TVD": row["TVD"],
+            "Poro": row["Poro"],
+            "DEN": row["DEN"],
+        }
+        try:
+            value = eval(compiled, {"__builtins__": {}}, values)
+        except (ArithmeticError, NameError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"MD={row['MD']}：Over_P 计算失败：{exc}") from exc
+
+        if isinstance(value, complex) or not isinstance(value, (int, float)) or not isfinite(value):
+            raise ValueError(
+                f"MD={row['MD']}：Over_P={value!r} 不是有限实数；"
+                f"TVD={row['TVD']}，Poro={row['Poro']}，DEN={row['DEN']}"
+            )
+        row["Over_P"] = float(value)
+    return rows
+
+
+def calculate_p_p(rows, stress_formulas):
+    """读取 P_p_FORMULAS，使用统一指数 n 计算地层孔隙压力。
+
+    使用已计算的 Over_P、P_n、AC_N，以及当前行原始 AC。
+    AC_N 与 AC 使用一致的声波时差单位，不代入 AC_usm。
+    原地更新 row['P_p']，不截断、不舍入，不写数据库。
+    系数未配置或公式执行失败时明确报错。
+    """
+    if not rows:
+        return rows
+
+    config = stress_formulas.get("P_p_FORMULAS", {})
+    formula = config.get("formula")
+    coefficients = config.get("coefficients", {})
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("应力公式文件必须提供 P_p_FORMULAS['formula'] 公式字符串")
+    if _is_missing(coefficients.get("n")):
+        raise ValueError("P_p_FORMULAS 的统一计算系数 n 尚未配置")
+    compiled_formula = compile(formula, "<P_p公式>", "eval")
+
+    for row in rows:
+        variables = dict(coefficients)
+        variables.update({
+            "Over_P": row["Over_P"],
+            "P_n": row["P_n"],
+            "AC_N": row["AC_N"],
+            "AC": row["AC"],
+        })
+        try:
+            row["P_p"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：P_p 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_rho_p(rows, stress_formulas):
+    """读取 RHO_P_FORMULA，使用 P_p、TVD 计算孔隙压力当量密度。
+
+    当前公式中 P_p 为 MPa，TVD 为 m，RHO_P 为 g/cm³。
+    TVD 为 0 时公式分母为 0，该行 RHO_P 记为 None，保留 P_p 结果。
+    原地更新 row['RHO_P']，不截断、不舍入，不写数据库。
+    其余公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = stress_formulas.get("RHO_P_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("应力公式文件必须提供 RHO_P_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<RHO_P公式>", "eval")
+
+    for row in rows:
+        if row["TVD"] == 0:
+            row["RHO_P"] = None
+            continue
+        try:
+            row["RHO_P"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                {"P_p": row["P_p"], "TVD": row["TVD"]},
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：RHO_P 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_horizontal_stress(rows, stress_formulas, stress_model):
+    """按已选模型计算 SHmax、Shmin，使用配置中的 beta_H、beta_h。
+
+    从 HORIZONTAL_STRESS_FORMULAS[stress_model] 读取两条公式，
+    从 HORIZONTAL_STRESS_FORMULAS['coefficients'] 读取构造应力系数。
+    六五模型使用 NU_S、Over_P、BIOT、P_p；七五模型额外使用 E_S。
+    保留七五模型公式内部的 E_S * 1000，不在主程序额外换算。
+    原地更新 row['SHmax']、row['Shmin']，不舍入，不写数据库。
+    """
+    if stress_model not in STRESS_MODELS:
+        raise ValueError("水平主应力计算必须明确选择 '六五模型' 或 '七五模型'")
+    if not rows:
+        return rows
+
+    config = stress_formulas.get("HORIZONTAL_STRESS_FORMULAS", {})
+    model_formulas = config.get(stress_model)
+    if not isinstance(model_formulas, dict):
+        raise ValueError(f"HORIZONTAL_STRESS_FORMULAS 未配置 {stress_model!r}")
+
+    compiled_formulas = {}
+    for field in ("SHmax", "Shmin"):
+        formula = model_formulas.get(field)
+        if not isinstance(formula, str) or not formula.strip():
+            raise ValueError(f"模型 {stress_model!r} 必须提供 {field} 公式字符串")
+        compiled_formulas[field] = compile(formula, f"<{stress_model}:{field}公式>", "eval")
+
+    coefficients = config.get("coefficients", {})
+    missing_coefficients = [
+        name for name in ("beta_H", "beta_h")
+        if _is_missing(coefficients.get(name))
+    ]
+    if missing_coefficients:
+        raise ValueError(
+            f"模型 {stress_model!r} 的 "
+            + "、".join(missing_coefficients)
+            + " 尚未配置，请在 stress_formulas.py 中填写构造应力系数"
+        )
+
+    for row in rows:
+        variables = dict(coefficients)
+        try:
+            variables.update({
+                "NU_S": row["NU_S"],
+                "Over_P": row["Over_P"],
+                "BIOT": row["BIOT"],
+                "P_p": row["P_p"],
+            })
+            if stress_model == "七五模型":
+                variables["E_S"] = row["E_S"]
+
+            # 两个结果均成功后再更新当前行，避免留下单侧计算结果。
+            values = {}
+            for field, compiled_formula in compiled_formulas.items():
+                values[field] = eval(
+                    compiled_formula,
+                    {"__builtins__": {}},
+                    variables,
+                )
+        except (ArithmeticError, KeyError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}，模型={stress_model!r}：水平主应力计算失败：{exc}"
+            ) from exc
+        row.update(values)
+    return rows
+
+
+def calculate_p_f(rows, stress_formulas):
+    """读取 P_f_FORMULA，使用已计算的主应力、孔隙压力及抗拉强度。
+
+    输入为 Shmin、SHmax、BIOT、P_p、ST；主应力使用本次所选模型的结果。
+    原地更新 row['P_f']，不截断、不舍入，不写数据库。
+    公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = stress_formulas.get("P_f_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("应力公式文件必须提供 P_f_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<P_f公式>", "eval")
+
+    for row in rows:
+        variables = {
+            "Shmin": row["Shmin"],
+            "SHmax": row["SHmax"],
+            "BIOT": row["BIOT"],
+            "P_p": row["P_p"],
+            "ST": row["ST"],
+        }
+        try:
+            row["P_f"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：P_f 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_rho_f(rows, stress_formulas):
+    """读取 RHO_F_FORMULA，使用 P_f、TVD 计算破裂压力当量密度。
+
+    当前公式中 P_f 为 MPa，TVD 为 m，RHO_F 为 g/cm³。
+    TVD 为 0 时 RHO_F 记为 None，保留该行 P_f。
+    原地更新 row['RHO_F']，不截断、不舍入，不写数据库。
+    其余公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = stress_formulas.get("RHO_F_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("应力公式文件必须提供 RHO_F_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<RHO_F公式>", "eval")
+
+    for row in rows:
+        if row["TVD"] == 0:
+            row["RHO_F"] = None
+            continue
+        try:
+            row["RHO_F"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                {"P_f": row["P_f"], "TVD": row["TVD"]},
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：RHO_F 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_p_c(rows, stress_formulas):
+    """读取 P_c_FORMULA，使用主应力、岩石强度和孔隙压力计算坍塌压力。
+
+    输入为 SHmax、Shmin、UCS、BIOT、P_p、FANG。
+    主应力采用本次选定模型的结果，FANG 输入为度，保留公式内部角度转换。
+    公式中的 sin、pi 使用 math.sin、math.pi。
+    原地更新 row['P_c']，不截断、不舍入，不写数据库。
+    公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = stress_formulas.get("P_c_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("应力公式文件必须提供 P_c_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<P_c公式>", "eval")
+
+    for row in rows:
+        variables = {
+            "SHmax": row["SHmax"],
+            "Shmin": row["Shmin"],
+            "UCS": row["UCS"],
+            "BIOT": row["BIOT"],
+            "P_p": row["P_p"],
+            "FANG": row["FANG"],
+        }
+        try:
+            row["P_c"] = eval(
+                compiled_formula,
+                {"__builtins__": {}, "sin": sin, "pi": pi},
+                variables,
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：P_c 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def calculate_rho_c(rows, stress_formulas):
+    """读取 RHO_C_FORMULA，使用 P_c、TVD 计算坍塌压力当量密度。
+
+    当前公式中 P_c 为 MPa，TVD 为 m，RHO_C 为 g/cm³。
+    TVD 为 0 时 RHO_C 记为 None，保留该行 P_c。
+    原地更新 row['RHO_C']，不截断、不舍入，不写数据库。
+    其余公式执行失败时，报出该行 MD 并停止。
+    """
+    if not rows:
+        return rows
+
+    formula = stress_formulas.get("RHO_C_FORMULA")
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError("应力公式文件必须提供 RHO_C_FORMULA 公式字符串")
+    compiled_formula = compile(formula, "<RHO_C公式>", "eval")
+
+    for row in rows:
+        if row["TVD"] == 0:
+            row["RHO_C"] = None
+            continue
+        try:
+            row["RHO_C"] = eval(
+                compiled_formula,
+                {"__builtins__": {}},
+                {"P_c": row["P_c"], "TVD": row["TVD"]},
+            )
+        except (ArithmeticError, NameError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MD={row['MD']}：RHO_C 公式计算失败：{exc}"
+            ) from exc
+    return rows
+
+
+def write_calculated_results(well_id, rows):
+    """按 MD 批量更新完整行的计算结果，全部成功后一次提交。
+
+    rows 应为主流程已经完成全部计算的完整行列表。
+    仅更新 CALCULATED_FIELDS 中的 23 列，保留输入、hard、Ab 及其他列。
+    None 按 SQLite NULL 写入，用于 TVD=0 时无法计算的当量密度。
+    写回失败或 MD 匹配行数不足时回滚本次全部更新，并关闭连接。
+    返回成功提交的更新行数；空列表返回 0。
+    """
+    if not rows:
+        return 0
+
+    required = ("MD",) + CALCULATED_FIELDS
+    for row in rows:
+        missing = [field for field in required if field not in row]
+        if missing:
+            raise ValueError(
+                f"MD={row.get('MD', '未知')}：缺少写回字段 "
+                + ", ".join(missing)
+                + "，请完成全部计算后再写回"
+            )
+
+    quoted_table = _quote_identifier(well_id)
+    assignments = ", ".join(
+        f"{_quote_identifier(field)} = ?" for field in CALCULATED_FIELDS
+    )
+    update_sql = f'UPDATE {quoted_table} SET {assignments} WHERE "MD" = ?'
+    conn = get_connection()
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            # 在写回事务中再次确认井表存在。
+            check_well_exists(well_id, conn)
+
+            columns = {
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({quoted_table})")
+            }
+            missing_columns = [field for field in required if field not in columns]
+            if missing_columns:
+                raise ValueError(
+                    f"井表 {well_id} 缺少写回字段：" + ", ".join(missing_columns)
+                )
+
+            cursor = conn.executemany(
+                update_sql,
+                (
+                    tuple(row[field] for field in CALCULATED_FIELDS) + (row["MD"],)
+                    for row in rows
+                ),
+            )
+            updated_count = cursor.rowcount
+            if updated_count != len(rows):
+                raise RuntimeError(
+                    f"计划更新 {len(rows)} 行，实际匹配 {updated_count} 行；"
+                    "本次写回已取消，请重新读取井数据后计算"
+                )
+    finally:
+        conn.close()
+    return updated_count
+
+
+# ==========================================================================
+# 【6】主计算流程：先读取数据库，再按计算块执行全部步骤
+# ==========================================================================
+
+def run_calculations(well_id, *, stress_model=None):
+    """对指定井执行26步计算，所有结果成功后统一写回对应井表。"""
+    if stress_model not in STRESS_MODELS:
+        raise ValueError("计算前必须选择 '六五模型' 或 '七五模型'")
+
+    # 【第0步】只检查井表是否存在，读取7个基础字段完整的深度点。
+    result = read_complete_well_data(well_id)
+    result["stress_model"] = stress_model
+    result["updated_count"] = 0
+    if not result["rows"]:
+        return result
+
+    rows = result["rows"]
+    # vars() 将 Python 模块变量映射为字典，兼容原计算函数的 .get() 调用。
+    geological_formulas = vars(geomechanics_formulas)
+    stress_formula_data = vars(stress_formulas)
+
+    # =====================================================================
+    # 【计算块1】声波与孔隙度（步骤01～03）
+    # =====================================================================
+    # region 计算块1
+    # [01] AC_usm
+    calculate_ac_usm(rows, geological_formulas)
+
+    # [02] DT_S
+    calculate_dt_s(rows, geological_formulas)
+
+    # [03] Poro
+    calculate_poro(rows, geological_formulas)
+
+    # endregion
+
+    # =====================================================================
+    # 【计算块2】泥质含量与可钻性（步骤04～06）
+    # =====================================================================
+    # region 计算块2
+    # [04] IGR
+    calculate_igr(rows, geological_formulas)
+
+    # [05] VSH
+    calculate_vsh(rows, geological_formulas)
+
+    # [06] Da
+    calculate_da(rows, geological_formulas)
+
+    # endregion
+
+    # =====================================================================
+    # 【计算块3】岩石弹性与强度（步骤07～15）
+    # =====================================================================
+    # region 计算块3
+    # [07] NU_D
+    calculate_nu_d(rows, geological_formulas)
+
+    # [08] E_D
+    calculate_e_d(rows, geological_formulas)
+
+    # [09] BIOT
+    calculate_biot(rows, geological_formulas)
+
+    # [10] NU_S
+    calculate_nu_s(rows, geological_formulas)
+
+    # [11] E_S
+    calculate_e_s(rows, geological_formulas)
+
+    # [12] UCS
+    calculate_ucs(rows, geological_formulas)
+
+    # [13] FANG
+    calculate_fang(rows, geological_formulas)
+
+    # [14] ST
+    calculate_st(rows, geological_formulas)
+
+    # [15] Coh
+    calculate_coh(rows, geological_formulas)
+
+    # endregion
+
+    # =====================================================================
+    # 【计算块4】地层压力（步骤16～20）
+    # =====================================================================
+    # region 计算块4
+    # [16] Over_P：直接根据 TVD、Poro、DEN 计算
+    calculate_over_p(rows, stress_formula_data)
+
+    # [17] P_n
+    calculate_p_n(rows, stress_formula_data)
+
+    # [18] AC_N
+    calculate_ac_n(rows, stress_formula_data)
+
+    # [19] P_p
+    calculate_p_p(rows, stress_formula_data)
+
+    # [20] RHO_P
+    calculate_rho_p(rows, stress_formula_data)
+
+    # endregion
+
+    # =====================================================================
+    # 【计算块5】水平主应力与井壁稳定性（步骤21～25）
+    # =====================================================================
+    # region 计算块5
+    # [21] SHmax / Shmin
+    calculate_horizontal_stress(rows, stress_formula_data, stress_model)
+
+    # [22] P_f
+    calculate_p_f(rows, stress_formula_data)
+
+    # [23] RHO_F
+    calculate_rho_f(rows, stress_formula_data)
+
+    # [24] P_c
+    calculate_p_c(rows, stress_formula_data)
+
+    # [25] RHO_C
+    calculate_rho_c(rows, stress_formula_data)
+
+    # endregion
+
+    # =====================================================================
+    # 【计算块6】统一写回数据库（步骤27）
+    # =====================================================================
+    # region 计算块6
+    # [26] 写回23个计算字段：按 MD 更新当前井表，一次事务提交
+    result["updated_count"] = write_calculated_results(result["well_id"], rows)
+    # endregion
+    return result
+
+
+# ==========================================================================
+# 【7】程序入口：优先使用命令行覆盖参数，否则使用【0】配置区
+# ==========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="读取邻井数据，计算参数并写回数据库")
+    parser.add_argument(
+        "well_id", nargs="?", default=None,
+        help="临时指定数据库井号；省略时使用顶部 WELL_ID",
+    )
+    parser.add_argument(
+        "--stress-model", choices=STRESS_MODELS,
+        help="临时指定模型；省略时使用 DEFAULT_STRESS_MODEL 或交互选择",
+    )
+    args = parser.parse_args()
+
+    well_id = args.well_id if args.well_id is not None else WELL_ID
+    stress_model = args.stress_model or DEFAULT_STRESS_MODEL
+    if stress_model is None:
+        try:
+            stress_model = select_stress_model()
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    print(f"本次计算井号：{well_id}")
+    print(f"本次计算模型：{stress_model}")
+    result = run_calculations(
+        well_id,
+        stress_model=stress_model,
+    )
+    print(f"井号：{result['well_id']}")
+    print(f"读取总行数：{result['total_count']}")
+    print(f"完整行数：{result['complete_count']}")
+    print(f"跳过行数：{result['skipped_count']}")
+    print(f"已计算 AC_usm：{result['complete_count']} 行")
+    print(f"已计算 DT_S：{result['complete_count']} 行")
+    print(f"已计算 Poro：{result['complete_count']} 行")
+    print(f"已计算 IGR：{result['complete_count']} 行")
+    print(f"已计算 VSH：{result['complete_count']} 行")
+    print(f"已计算 Da：{result['complete_count']} 行")
+    print(f"已计算 NU_D：{result['complete_count']} 行")
+    print(f"已计算 E_D：{result['complete_count']} 行")
+    print(f"已计算 BIOT：{result['complete_count']} 行")
+    print(f"已计算 NU_S：{result['complete_count']} 行")
+    print(f"已计算 E_S：{result['complete_count']} 行")
+    print(f"已计算 UCS：{result['complete_count']} 行")
+    print(f"已计算 FANG：{result['complete_count']} 行")
+    print(f"已计算 ST：{result['complete_count']} 行")
+    print(f"已计算 Coh：{result['complete_count']} 行")
+    print(f"已计算 P_n：{result['complete_count']} 行")
+    print(f"已计算 AC_N：{result['complete_count']} 行")
+    print(f"已计算 Over_P：{result['complete_count']} 行")
+    print(f"已计算 P_p：{result['complete_count']} 行")
+    rho_p_count = sum(row["RHO_P"] is not None for row in result["rows"])
+    print(f"已计算 RHO_P：{rho_p_count} 行；TVD=0 的行记为空值")
+    print(f"已计算 SHmax、Shmin：{result['complete_count']} 行，模型：{result['stress_model']}")
+    print(f"已计算 P_f：{result['complete_count']} 行")
+    rho_f_count = sum(row["RHO_F"] is not None for row in result["rows"])
+    print(f"已计算 RHO_F：{rho_f_count} 行；TVD=0 的行记为空值")
+    print(f"已计算 P_c：{result['complete_count']} 行")
+    rho_c_count = sum(row["RHO_C"] is not None for row in result["rows"])
+    print(f"已计算 RHO_C：{rho_c_count} 行；TVD=0 的行记为空值")
+    print(f"数据库写回完成：{result['updated_count']} 行，{len(CALCULATED_FIELDS)} 个结果字段")
+    print("hard、Ab 尚未配置计算公式，保留数据库原值。")
+
+
+if __name__ == "__main__":
+    main()
